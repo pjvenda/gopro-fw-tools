@@ -39,6 +39,8 @@ typedef struct {
 	/* The image starts 0x100 bytes after the beginning of the header. */
 } section_header; 
 
+#define GLOBAL_HDR_SIZE 224
+
 /* Magic is 0xA3 0x24 0xEB 0x90 */
 
 static int find_magic(FILE *fp);
@@ -95,6 +97,27 @@ static int find_magic(FILE *fp)
 	return -1;
 }
 
+/*
+ * FW header appears to be big-endian ?
+ */
+static uint32_t read_word_le(unsigned char *buf, int offset);
+static uint32_t read_word_le(unsigned char *buf, int offset)
+{
+	return (buf[offset+0] << 0) |
+	       (buf[offset+1] << 8) |
+	       (buf[offset+2] << 16) |
+	       (buf[offset+3] << 24);
+}
+
+static void write_word_le(unsigned char *buf, int offset, uint32_t word);
+static void write_word_le(unsigned char *buf, int offset, uint32_t word)
+{
+	buf[offset+0] = word >> 0;
+	buf[offset+1] = word >> 8;
+	buf[offset+2] = word >> 16;
+	buf[offset+3] = word >> 24;
+}
+
 static unsigned int read_word(FILE *fd);
 static unsigned int read_word(FILE *fd)
 {
@@ -104,27 +127,6 @@ static unsigned int read_word(FILE *fd)
 	r |= fgetc(fd) << 16;
 	r |= fgetc(fd) << 24;
 	return r;
-}
-
-static int save_section(const char *output_name, int length,FILE *fd);
-static int save_section(const char *output_name, int length,FILE *fd)
-{
-	FILE *ofd;
-	int i;
-	char t;
-	ofd = fopen(output_name, "wb+");
-
-	if (!ofd) {
-		printf("Could not write to %s\n", output_name);
-		return -1;
-	}
-
-	for (i = 0; i < length; i++) {
-		fread(&t, 1, 1, fd);
-		fwrite(&t, 1, 1, ofd);
-	}
-	fclose(ofd);
-	return 0;
 }
 
 static int read_file(FILE *fd, unsigned char *buf, int size);
@@ -143,10 +145,8 @@ int main(int argc, char **argv)
 {
 	int verbose = 1;
 	int ret = 0;
-	int length;
 
 	int num;
-	char *str;
 
 	FILE *ifd; /* original firmware file */
 	uint32_t version;
@@ -154,8 +154,17 @@ int main(int argc, char **argv)
 	uint32_t flags;
 	uint32_t magic;
 	uint32_t fcrc;
+	uint32_t icrc;
 	uint32_t laddr;
+	int length;
 	long int section_offset;
+	unsigned char global_hdr[GLOBAL_HDR_SIZE];
+	uint32_t global_crc;
+	unsigned char *fw_content;
+	struct stat ist;
+	int isize;
+
+	unsigned char test[4];
 
 	FILE *ofd; /* repacked firmware file */
 	char zero_buf[0x100];
@@ -164,8 +173,8 @@ int main(int argc, char **argv)
 	FILE *sfd; /* section file */
 	uint32_t scrc;
 	unsigned char *buf;
-	struct stat st;
-	int size;
+	struct stat sst;
+	int ssize;
 	section_header sh;
 
 	if (argc != 3) {
@@ -175,11 +184,34 @@ int main(int argc, char **argv)
 
 	/* open original firmware */
 
+	stat(argv[1],&ist);
+	isize = ist.st_size;
+
 	ifd = fopen(argv[1], "rb");
 	if (!ifd) {
 		printf("Could not open firmware image %s\n", argv[1]);
 		return -1;
 	}
+	
+	read_file(ifd, global_hdr, GLOBAL_HDR_SIZE);
+	// TODO: check for errors
+	global_crc = read_word_le(global_hdr, 0);
+	fw_content = malloc(isize);
+	read_file(ifd, fw_content, isize-GLOBAL_HDR_SIZE);
+	// TODO: check for errors
+	icrc = crc32(fw_content, isize-GLOBAL_HDR_SIZE);
+	write_word_le(test, 0, icrc);
+	free(fw_content);
+	rewind(ifd);
+
+	if (verbose) {
+		fprintf(stderr, "Original firmware image: %s\n", argv[1]);
+		fprintf(stderr, "\tSize: %d (%d without top header)\n", isize, isize-GLOBAL_HDR_SIZE);
+		fprintf(stderr, "\tStored CRC: %08x\n", global_crc);
+		fprintf(stderr, "\tCalculated CRC: %08x\n", icrc);
+		fprintf(stderr, "\tCalculated CRC (le): %08x\n", test);
+	}
+	// TODO: this global CRC shenanigan is not working
 
 	ofd = fopen(argv[2], "w+");
 	if (!ifd) {
@@ -228,18 +260,18 @@ int main(int argc, char **argv)
 			continue; /* skip to next section */
 		}
 
-		stat(sfname,&st);
-		size = st.st_size;
+		stat(sfname,&sst);
+		ssize = sst.st_size;
 
-		buf = malloc(size);
-		ret = read_file(sfd, buf, size);
+		buf = malloc(ssize);
+		ret = read_file(sfd, buf, ssize);
 
 		if (ret) {
 			printf("Could not read section file %s (%d)\n", sfname, ret);
 			num++;
 			continue;
 		}
-		scrc = crc32(buf, size);
+		scrc = crc32(buf, ssize);
 
 		if (verbose)
 		{
@@ -251,7 +283,7 @@ int main(int argc, char **argv)
 			fprintf(stderr, "CRC\t\t0x%08x\t\t0x%08x\n", fcrc, scrc);
 			fprintf(stderr, "Version\t\t0x%08x\n", version);	
 			fprintf(stderr, "Build\t\t0x%08x\n", build_date);
-			fprintf(stderr, "Length\t\t0x%08x\t\t0x%08x\n", length, size);
+			fprintf(stderr, "Length\t\t0x%08x\t\t0x%08x\n", length, ssize);
 			fprintf(stderr, "Load address\t0x%08x\n",laddr);
 			fprintf(stderr, "Flags\t\t0x%08x\n", flags);
 			fprintf(stderr, "Magic\t\t0x%08x\n", magic);
@@ -273,7 +305,7 @@ int main(int argc, char **argv)
 		// TODO: check for errors
 		fwrite(zero_buf,1,sizeof(zero_buf)-sizeof(section_header),ofd);
 		// TODO: check for errors
-		fwrite(buf,1,size,ofd); 		
+		fwrite(buf,1,ssize,ofd); 		
 		// TODO: check for errors
 
 		free(buf);
