@@ -25,7 +25,9 @@ CFLAGS += -Wformat=2 -Wformat-security -Wmissing-format-attribute
 CFLAGS += -fshort-enums -fstrict-aliasing -fno-common
 CFLAGS += -D_REENTRANT -D_THREAD_SAFE -pipe
 
-all: fwparser goprom fwunpacker h3-wifi-address h4-section-patch h3plus-section-patch
+all: fwparser goprom fwunpacker fwpacker h3-wifi-address h4-section-patch h3plus-section-patch
+
+fwpacker:	crc32.o
 
 h3-wifi-address: crc32.o
 
@@ -34,5 +36,5 @@ h4-section-patch: crc32.o
 h3plus-section-patch: crc32.o
 
 clean:
-	rm -f fwparser goprom fwunpacker h3-wifi-address h4-section-patch h3plus-section-patch *~
+	rm -f fwparser fwpacker goprom fwunpacker h3-wifi-address h4-section-patch h3plus-section-patch *~
 
