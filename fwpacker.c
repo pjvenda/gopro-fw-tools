@@ -26,7 +26,18 @@
 
 #include "crc32.h"
 
-#define SECTION_COUNT 9
+typedef struct {
+	/* 0x00 */ uint32_t crc32;
+	/* 0x04 */ uint32_t version;
+	/* 0x08 */ uint8_t build_date_day;
+	/* 0x09 */ uint8_t build_date_month;
+	/* 0x10 */ uint16_t build_date_year;
+	/* 0x12 */ uint32_t length;
+	/* 0x16 */ uint32_t loading_address;
+	/* 0x20 */ uint32_t flags;
+	/* 0x24 */ uint32_t magic;
+	/* The image starts 0x100 bytes after the beginning of the header. */
+} section_header; 
 
 /* Magic is 0xA3 0x24 0xEB 0x90 */
 
@@ -132,113 +143,147 @@ int main(int argc, char **argv)
 {
 	int verbose = 1;
 	int ret = 0;
-	unsigned int version, build_date, flags, magic;
-	unsigned int section_offset;
 	int length;
 
-	int i;
-	char *prefix;
-	char *section_fname[SECTION_COUNT];
-	FILE *section_fp;
+	int num;
 	char *str;
-	int size;
-	struct stat st;
+
+	FILE *ifd; /* original firmware file */
+	uint32_t version;
+	uint32_t build_date;
+	uint32_t flags;
+	uint32_t magic;
+	uint32_t fcrc;
+	uint32_t laddr;
+	long int section_offset;
+
+	FILE *ofd; /* repacked firmware file */
+	char zero_buf[0x100];
+
+	char *sfname;
+	FILE *sfd; /* section file */
+	uint32_t scrc;
 	unsigned char *buf;
-	uint32_t crc;
-	FILE *orig;
+	struct stat st;
+	int size;
+	section_header sh;
 
-	if (argc != 4) {
-		printf("Usage: %s [original] [prefix] [output]\n", argv[0]);
+	if (argc != 3) {
+		printf("Usage: %s [original_firmware_image] [repacked_firmware_image]\n", argv[0]);
 		return -1;
 	}
 
+	/* open original firmware */
 
-
-
-	orig = fopen(argv[1], "rb");
-	if (!orig) {
-		printf("Could not open %s\n", argv[1]);
+	ifd = fopen(argv[1], "rb");
+	if (!ifd) {
+		printf("Could not open firmware image %s\n", argv[1]);
 		return -1;
 	}
 
-	ret = find_magic(orig);
-	if (ret < 0) {
-		printf("End of file reached.\n");
-		fclose(orig);
-		return 0;
+	ofd = fopen(argv[2], "w+");
+	if (!ifd) {
+		printf("Could not open output firmware file %s\n", argv[2]);
+		return -1;
 	}
 
-	fseek(orig, -28, SEEK_CUR);
-	crc = read_word(orig);
-	version = read_word(orig);
-	build_date = read_word(orig);
-	length = read_word(orig);
-	read_word(orig);
-	flags = read_word(orig);
-	magic = read_word(orig);
-	fseek(orig, 0x100-28, SEEK_CUR);
-	section_offset = ftell(orig);
+	sfname = malloc(sizeof("section_")+3);
+	memset(zero_buf, 0, sizeof(zero_buf));
 
-	if (verbose)
-	{
-		fprintf(stderr, "Section found\n");
-		fprintf(stderr, "\tCRC\t= %08x\n", crc);
-		fprintf(stderr, "\tVersion = %08x\n", version);
-		fprintf(stderr, "\tBuild\t= %08x\n", build_date);
-		fprintf(stderr, "\tLength\t= %08x\n", length);
-		fprintf(stderr, "\tFlags\t= %08x\n", flags);
-		fprintf(stderr, "\tMagic\t= %08x\n", magic);
-	}
+	/* go through firmware image looking for sections */
 
-	fclose(orig);
+	num = 0;
 
-
-
-
-
-	prefix = argv[2];
-
-	for (i=0;i<SECTION_COUNT;i++) {
-		str=(char *)malloc(strlen(prefix+3));
-		ret=snprintf(str,strlen(prefix)+3,"%s_%d",prefix,i);
-		// TODO: should really check this return value
-		section_fname[i]=str;
-	}
-
-
-	for (i=0;i<SECTION_COUNT;i++) {
-		section_fp = fopen(section_fname[i],"rb");
-		if (!section_fp) {
-			printf("Could not open %s\n", section_fname[i]);
-			ret=-1;
-			goto cleanup; // o_O
+	while (1) {
+		ret = find_magic(ifd);
+		if (ret < 0) {
+			printf("End of file reached.\n");
+			break;
 		}
 
-		stat(section_fname[i],&st);
+		fseek(ifd, -28, SEEK_CUR);
+		section_offset = ftell(ifd);
+		
+		fcrc = read_word(ifd);
+		version = read_word(ifd);
+		build_date = read_word(ifd);
+		length = read_word(ifd);
+		laddr = read_word(ifd);
+		flags = read_word(ifd);
+		magic = read_word(ifd);
+		fseek(ifd, 0x100-28, SEEK_CUR);
+
+		fseek(ifd, length, SEEK_CUR);
+
+		if (length < 0)
+			continue;
+
+		/* look for and process section file */
+
+		snprintf(sfname,sizeof("section_")+2,"section_%d",num);
+		sfd = fopen(sfname,"rb");
+		if (!sfd) {
+			printf("Could not open section file %s\n", sfname);
+			num++;
+			continue; /* skip to next section */
+		}
+
+		stat(sfname,&st);
 		size = st.st_size;
 
 		buf = malloc(size);
-		ret = read_file(section_fp, buf, size);
+		ret = read_file(sfd, buf, size);
+
+		if (ret) {
+			printf("Could not read section file %s (%d)\n", sfname, ret);
+			num++;
+			continue;
+		}
+		scrc = crc32(buf, size);
+
+		if (verbose)
+		{
+			fprintf(stderr, "\n");
+			fprintf(stderr, "Section %d:\n",num);
+			fprintf(stderr, "\t\tFirmware\t\tSection file\n");
+			fprintf(stderr, "File\t\t%s\t\t%s\n", argv[1], sfname);
+			fprintf(stderr, "Offset (w/hdr)\t%ld\n", section_offset);
+			fprintf(stderr, "CRC\t\t0x%08x\t\t0x%08x\n", fcrc, scrc);
+			fprintf(stderr, "Version\t\t0x%08x\n", version);	
+			fprintf(stderr, "Build\t\t0x%08x\n", build_date);
+			fprintf(stderr, "Length\t\t0x%08x\t\t0x%08x\n", length, size);
+			fprintf(stderr, "Load address\t0x%08x\n",laddr);
+			fprintf(stderr, "Flags\t\t0x%08x\n", flags);
+			fprintf(stderr, "Magic\t\t0x%08x\n", magic);
+		}
+
+		/* prepare header structure */
+		sh.crc32 = scrc;
+		sh.version = version;
+		memcpy(&(sh.build_date_day),&build_date,1);
+		memcpy(&(sh.build_date_month),&build_date+1,1);
+		memcpy(&(sh.build_date_month),&build_date+2,2);
+		sh.length = length;
+		sh.loading_address = laddr;
+		sh.flags = flags;
+		sh.magic = magic;
+
+		/* write section to output firmware image */
+		fwrite(&sh,1,sizeof(section_header),ofd);
 		// TODO: check for errors
-		crc = crc32(buf, size);
-
-		printf("section file: %s; size: %d; crc: 0x%08x\n",section_fname[i],size,crc);
-
-
-
-
+		fwrite(zero_buf,1,sizeof(zero_buf)-sizeof(section_header),ofd);
+		// TODO: check for errors
+		fwrite(buf,1,size,ofd); 		
+		// TODO: check for errors
 
 		free(buf);
-		fclose(section_fp);	
+		fclose(sfd);
+		num++;
 	}
 
-
-	cleanup:
-
-	// cleanup: clear section file names
-	for (i=0;i<SECTION_COUNT;i++) {
-		free(section_fname[i]);
-	}
+	fclose(ifd);
+	fclose(ofd);
+	free(sfname);
 
 	return ret;
 }
